@@ -220,7 +220,7 @@ impl<'de, const N: usize> Deserialize<'de> for BoundedString<N> {
 /// - 256–1023 bytes
 ///
 /// This enum selects the smallest valid representation automatically.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum IppTextValue {
     Short(IppShortString),
@@ -343,6 +343,115 @@ fn get_len_string(data: &mut Bytes) -> Result<String, IppParseError> {
     }
 }
 
+/// Represents IPP datetime value
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct IppDateTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minutes: u8,
+    pub seconds: u8,
+    pub deci_seconds: u8,
+    pub utc_dir: char,
+    pub utc_hours: u8,
+    pub utc_mins: u8,
+}
+
+impl IppDateTime {
+    pub fn to_bytes(&self) -> Bytes {
+        let mut bytes = BytesMut::new();
+        bytes.put_u16(self.year);
+        bytes.put_u8(self.month);
+        bytes.put_u8(self.day);
+        bytes.put_u8(self.hour);
+        bytes.put_u8(self.minutes);
+        bytes.put_u8(self.seconds);
+        bytes.put_u8(self.deci_seconds);
+        bytes.put_u8(self.utc_dir as u8);
+        bytes.put_u8(self.utc_hours);
+        bytes.put_u8(self.utc_mins);
+        bytes.freeze()
+    }
+}
+
+impl fmt::Display for IppDateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            year,
+            month,
+            day,
+            hour,
+            minutes,
+            seconds,
+            deci_seconds,
+            utc_dir,
+            utc_hours,
+            ..
+        } = self;
+        write!(
+            f,
+            "{year}-{month}-{day},{hour}:{minutes}:{seconds}.{deci_seconds},{utc_dir}{utc_hours}utc"
+        )
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl<Tz: chrono::TimeZone> From<chrono::DateTime<Tz>> for IppDateTime {
+    fn from(value: chrono::DateTime<Tz>) -> Self {
+        use chrono::{Datelike, Offset, Timelike};
+
+        let offset = value.offset().fix().local_minus_utc();
+
+        Self {
+            year: value.year() as u16,
+            month: value.month() as u8,
+            day: value.day() as u8,
+            hour: value.hour() as u8,
+            minutes: value.minute() as u8,
+            seconds: value.second() as u8,
+            deci_seconds: (value.nanosecond() / 100_000_000) as u8,
+            utc_dir: if offset < 0 { '-' } else { '+' },
+            utc_hours: (offset.abs() / 3600) as u8,
+            utc_mins: (offset.abs() % 3600 / 60) as u8,
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<IppDateTime> for chrono::DateTime<chrono::FixedOffset> {
+    type Error = crate::error::IppError;
+
+    fn try_from(value: IppDateTime) -> Result<Self, Self::Error> {
+        use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+
+        let err = || IppParseError::InvalidDateTime;
+
+        let seconds = value.utc_hours as i32 * 3600 + value.utc_mins as i32 * 60;
+        let offset = if value.utc_dir == '-' {
+            FixedOffset::west_opt(seconds)
+        } else if value.utc_dir == '+' {
+            FixedOffset::east_opt(seconds)
+        } else {
+            None
+        }
+        .ok_or_else(err)?;
+
+        let datetime = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(value.year as _, value.month as _, value.day as _).ok_or_else(err)?,
+            NaiveTime::from_hms_milli_opt(
+                value.hour as _,
+                value.minutes as _,
+                value.seconds as _,
+                value.deci_seconds as u32 * 100,
+            )
+            .ok_or_else(err)?,
+        );
+        Ok(offset.from_local_datetime(&datetime).single().ok_or_else(err)?)
+    }
+}
+
 /// IPP attribute values as defined in [RFC 8010](https://tools.ietf.org/html/rfc8010)
 /// the length for TextWithoutLanguage, TextWithLanguage, and OctetString values is heavily attribute dependent
 /// usual values are 127, 255, and 1023 however as these are attribute dependent, a [`IppTextValue`] is used to allow the calling routine to assert expected text length.
@@ -375,18 +484,7 @@ pub enum IppValue {
     Array(Vec<IppValue>),
     Collection(BTreeMap<IppName, IppValue>),
     MimeMediaType(IppMimeMediaType),
-    DateTime {
-        year: u16,
-        month: u8,
-        day: u8,
-        hour: u8,
-        minutes: u8,
-        seconds: u8,
-        deci_seconds: u8,
-        utc_dir: char,
-        utc_hours: u8,
-        utc_mins: u8,
-    },
+    DateTime(IppDateTime),
     MemberAttrName(IppKeyword),
     Resolution {
         cross_feed: i32,
@@ -406,6 +504,108 @@ pub enum IppValue {
 }
 
 impl IppValue {
+    pub fn new_integer(value: i32) -> Self {
+        Self::Integer(value)
+    }
+
+    pub fn new_enum(value: i32) -> Self {
+        Self::Enum(value)
+    }
+
+    pub fn new_octet_string(data: Bytes) -> Self {
+        Self::OctetString(data)
+    }
+
+    pub fn new_text_without_language(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppTextValue::new(value).map(Self::TextWithoutLanguage)
+    }
+
+    pub fn new_name_without_language(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppName::new(value).map(Self::NameWithoutLanguage)
+    }
+
+    pub fn new_text_with_language(language: impl Into<String>, text: impl Into<String>) -> Result<Self, IppParseError> {
+        Ok(Self::TextWithLanguage {
+            language: IppLanguage::new(language)?,
+            text: IppTextValue::new(text)?,
+        })
+    }
+
+    pub fn new_name_with_language(language: impl Into<String>, name: impl Into<String>) -> Result<Self, IppParseError> {
+        Ok(Self::NameWithLanguage {
+            language: IppLanguage::new(language)?,
+            name: IppName::new(name)?,
+        })
+    }
+
+    pub fn new_charset(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppCharset::new(value).map(Self::Charset)
+    }
+
+    pub fn new_natural_language(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppLanguage::new(value).map(Self::NaturalLanguage)
+    }
+
+    pub fn new_uri(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppString::new(value).map(Self::Uri)
+    }
+
+    pub fn new_uri_scheme(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppString::new(value).map(Self::UriScheme)
+    }
+
+    pub fn new_range_of_integer(min: i32, max: i32) -> Self {
+        Self::RangeOfInteger { min, max }
+    }
+
+    pub fn new_boolean(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+
+    pub fn new_keyword(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppKeyword::new(value).map(Self::Keyword)
+    }
+
+    pub fn new_array() -> Self {
+        Self::Array(Vec::new())
+    }
+
+    pub fn new_collection() -> Self {
+        Self::Collection(BTreeMap::new())
+    }
+
+    pub fn new_mime_media_type(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppMimeMediaType::new(value).map(Self::MimeMediaType)
+    }
+
+    pub fn new_datetime(datetime: IppDateTime) -> Self {
+        Self::DateTime(datetime)
+    }
+
+    pub fn new_member_attr_name(value: impl Into<String>) -> Result<Self, IppParseError> {
+        IppKeyword::new(value).map(Self::MemberAttrName)
+    }
+
+    pub fn new_resolution(cross_feed: i32, feed: i32, units: i8) -> Self {
+        Self::Resolution {
+            cross_feed,
+            feed,
+            units,
+        }
+    }
+
+    pub fn new_no_value() -> Self {
+        Self::NoValue
+    }
+
+    pub fn new_other(tag: u8, data: Bytes) -> Self {
+        Self::Other { tag, data }
+    }
+
+    pub fn new_non_utf8(tag: ValueTag, data: Bytes) -> Self {
+        Self::NonUtf8 { tag, data }
+    }
+
     /// Convert to a binary tag
     pub fn to_tag(&self) -> u8 {
         match *self {
@@ -504,7 +704,7 @@ impl IppValue {
             ValueTag::Boolean => IppValue::Boolean(data.get_u8() != 0),
             ValueTag::Keyword => Self::from_bounded_utf8(IppValue::Keyword, ipp_tag, data)?,
             ValueTag::MimeMediaType => Self::from_bounded_utf8(IppValue::MimeMediaType, ipp_tag, data)?,
-            ValueTag::DateTime => IppValue::DateTime {
+            ValueTag::DateTime => IppValue::DateTime(IppDateTime {
                 year: data.get_u16(),
                 month: data.get_u8(),
                 day: data.get_u8(),
@@ -515,7 +715,7 @@ impl IppValue {
                 utc_dir: data.get_u8() as char,
                 utc_hours: data.get_u8(),
                 utc_mins: data.get_u8(),
-            },
+            }),
             ValueTag::MemberAttrName => Self::from_bounded_utf8(IppValue::MemberAttrName, ipp_tag, data)?,
             ValueTag::Resolution => IppValue::Resolution {
                 cross_feed: data.get_i32(),
@@ -618,29 +818,9 @@ impl IppValue {
                 buffer.put_u8(ValueTag::EndCollection as u8);
                 buffer.put_u32(0);
             }
-            IppValue::DateTime {
-                year,
-                month,
-                day,
-                hour,
-                minutes,
-                seconds,
-                deci_seconds,
-                utc_dir,
-                utc_hours,
-                utc_mins,
-            } => {
+            IppValue::DateTime(ref datetime) => {
                 buffer.put_u16(11);
-                buffer.put_u16(year);
-                buffer.put_u8(month);
-                buffer.put_u8(day);
-                buffer.put_u8(hour);
-                buffer.put_u8(minutes);
-                buffer.put_u8(seconds);
-                buffer.put_u8(deci_seconds);
-                buffer.put_u8(utc_dir as u8);
-                buffer.put_u8(utc_hours);
-                buffer.put_u8(utc_mins);
+                buffer.put(datetime.to_bytes())
             }
             IppValue::Resolution {
                 cross_feed,
@@ -692,21 +872,7 @@ impl fmt::Display for IppValue {
                 let s: Vec<String> = coll.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 write!(f, "<{}>", s.join(", "))
             }
-            IppValue::DateTime {
-                year,
-                month,
-                day,
-                hour,
-                minutes,
-                seconds,
-                deci_seconds,
-                utc_dir,
-                utc_hours,
-                ..
-            } => write!(
-                f,
-                "{year}-{month}-{day},{hour}:{minutes}:{seconds}.{deci_seconds},{utc_dir}{utc_hours}utc"
-            ),
+            IppValue::DateTime(ref datetime) => datetime.fmt(f),
             IppValue::Resolution {
                 cross_feed,
                 feed,
@@ -797,6 +963,56 @@ mod tests {
     use super::*;
     use crate::{attribute::IppAttribute, model::DelimiterTag, parser::IppParser, reader::IppReader};
 
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn chrono_datetime_roundtrip() {
+        use chrono::{DateTime, FixedOffset};
+
+        let original = IppDateTime {
+            year: 2020,
+            month: 2,
+            day: 13,
+            hour: 12,
+            minutes: 34,
+            seconds: 22,
+            deci_seconds: 9,
+            utc_dir: '+',
+            utc_hours: 5,
+            utc_mins: 30,
+        };
+
+        let dt: DateTime<FixedOffset> = original.clone().try_into().unwrap();
+        assert_eq!(dt.to_string(), "2020-02-13 12:34:22.900 +05:30");
+
+        let back: IppDateTime = dt.into();
+        assert_eq!(back, original);
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn chrono_datetime_negative_offset() {
+        use chrono::{DateTime, FixedOffset};
+
+        let original = IppDateTime {
+            year: 1999,
+            month: 12,
+            day: 31,
+            hour: 23,
+            minutes: 59,
+            seconds: 59,
+            deci_seconds: 8,
+            utc_dir: '-',
+            utc_hours: 8,
+            utc_mins: 0,
+        };
+
+        let dt: DateTime<FixedOffset> = original.clone().try_into().unwrap();
+        assert_eq!(dt.to_string(), "1999-12-31 23:59:59.800 -08:00");
+
+        let back: IppDateTime = dt.into();
+        assert_eq!(back, original);
+    }
+
     fn value_check(value: IppValue) {
         let mut b = value.to_bytes();
         b.advance(2); // skip value size
@@ -857,7 +1073,7 @@ mod tests {
         value_check(IppValue::MimeMediaType(
             "mime".try_into().expect("failed to create IPP text value"),
         ));
-        value_check(IppValue::DateTime {
+        value_check(IppValue::DateTime(IppDateTime {
             year: 2020,
             month: 2,
             day: 13,
@@ -868,7 +1084,7 @@ mod tests {
             utc_dir: 'c',
             utc_hours: 1,
             utc_mins: 30,
-        });
+        }));
         value_check(IppValue::MemberAttrName(
             "member".try_into().expect("failed to create IPP text value"),
         ));
